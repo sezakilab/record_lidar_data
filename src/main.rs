@@ -1,9 +1,10 @@
 extern crate byteorder;
+extern crate chrono;
 extern crate getopts;
 extern crate num;
 #[macro_use] extern crate serde_derive;
 extern crate serde_yaml;
-extern crate chrono;
+extern crate time;
 
 use std::io::prelude::*;
 use std::cmp::PartialEq;
@@ -11,12 +12,13 @@ use std::env;
 use std::fs::File;
 use std::io::{BufWriter, Write, BufReader, Read};
 use std::net::TcpStream;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use chrono::prelude::*;
 use getopts::Options;
-use num::FromPrimitive;
+use num::{FromPrimitive, pow, ToPrimitive};
+use time::Duration;
+
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 enum DataType {
@@ -55,6 +57,35 @@ impl FromPrimitive for DataType {
             0x2850 => Some(DataType::EgoMotionData),
             0x7100 => Some(DataType::SensorInfo),
             _ => None,
+        }
+    }
+}
+
+impl ToPrimitive for DataType {
+    fn to_i64(self: &DataType) -> Option<i64> {
+        match self {
+                &DataType::Command => Some(0x2010),
+                &DataType::CommandReply => Some(0x2020),
+                &DataType::Error => Some(0x2030),
+                &DataType::ScanData => Some(0x2202),
+                &DataType::ObjectData => Some(0x2221),
+                &DataType::MovementData => Some(0x2805),
+                &DataType::EgoMotionData => Some(0x2850),
+                &DataType::SensorInfo => Some(0x7100),
+                _ => None,
+        }
+    }
+    fn to_u64(self: &DataType) -> Option<u64> {
+        match self {
+                &DataType::Command => Some(0x2010),
+                &DataType::CommandReply => Some(0x2020),
+                &DataType::Error => Some(0x2030),
+                &DataType::ScanData => Some(0x2202),
+                &DataType::ObjectData => Some(0x2221),
+                &DataType::MovementData => Some(0x2805),
+                &DataType::EgoMotionData => Some(0x2850),
+                &DataType::SensorInfo => Some(0x7100),
+                _ => None,
         }
     }
 }
@@ -367,7 +398,6 @@ fn receive_payload(stream: &mut std::net::TcpStream, payload_len: u32) -> Vec<u8
     let mut payload: Vec<u8> = Vec::new();
     while remaining_len > 0 {
         let mut msg_len = stream.read(&mut buffer[..]).unwrap();
-        // println!("Error: {} - {}", remaining_len, msg_len);
         msg_len = if msg_len > (remaining_len as usize) {remaining_len as usize} else {msg_len};
         remaining_len = remaining_len - (msg_len as u32);
         payload.append(&mut buffer[0..msg_len].to_vec());
@@ -380,27 +410,58 @@ fn print_usage(program: &str, opts: Options) {
     print!("{}", opts.usage(&brief));
 }
 
-// magic_word: BigEndian::read_u32(&buffer[0..4]),
-// size_of_previous_messages: BigEndian::read_u32(&buffer[4..8]),
-// size_of_message_data: BigEndian::read_u32(&buffer[8..12]),
-// reserved: buffer[12],
-// device_id: buffer[13],
-// data_type: DataType::from_u16(BigEndian::read_u16(&buffer[14..16])).unwrap(),
-// ntp_time: BigEndian::read_u64(&buffer[16..24]),
-fn sync_time(stream: &mut TcpStream) {
-    // let magic_word: u32 = 0xaffec0c2;
-    // let size_of_previous_messages: u32 = 0;
-    // let size_of_message_data: u32 = ;
-    // let reserved: u8 = 0;
-    // let device_id: u8 = 0;
-    // let data_type: DataType = DataType::Command;
-let local: DateTime<Local> = Local::now();
-let standard_time: DateTime<Local> = 
-    println!("{:?}", local);
-    // let ntp_time = 
-    // let header: Header = Header {
+fn ntp_time_now() -> u64 {
+    let local: DateTime<Utc> = Utc::now();
+    let standard_time: DateTime<Utc> = Utc.ymd(1900, 1, 1).and_hms(0, 0, 0);
+    let diff = local.signed_duration_since(standard_time);
+    println!("{:?}", diff.num_seconds() as u32);
+    println!("{:?}", diff.num_seconds());
+    let mut buffer: [u8; 8] = [0; 8];
+    let precise = diff.num_nanoseconds().unwrap() * (pow::pow(2, 32) / pow::pow(10, 9));
+    BigEndian::write_u32(&mut buffer[0..4], diff.num_seconds() as u32);
+    BigEndian::write_u32(&mut buffer[4..8], precise as u32);
+    BigEndian::read_u64(&buffer)
+}
 
-    // }
+fn encode_header(header: &Header, buffer: &mut [u8]) {
+    BigEndian::write_u32(&mut buffer[0..4], header.magic_word);
+    BigEndian::write_u32(&mut buffer[4..8], header.size_of_previous_messages);
+    BigEndian::write_u32(&mut buffer[8..12], header.size_of_message_data);
+    buffer[12] = header.reserved;
+    buffer[13] = header.device_id;
+    BigEndian::write_u16(&mut buffer[14..16], header.data_type.to_u64().unwrap() as u16);
+    BigEndian::write_u64(&mut buffer[16..24], header.ntp_time);
+}
+
+fn sync_time(stream: &mut TcpStream) {
+    let mut buffer: [u8; 34] = [0; 34];
+    let now: u64 = ntp_time_now();
+    let header: Header = Header {
+        magic_word: 0xaffec0c2,
+        size_of_previous_messages: 0,
+        size_of_message_data: 10,
+        reserved: 0,
+        device_id: 1,
+        data_type: DataType::Command,
+        ntp_time: 0,
+    };
+    encode_header(&header, &mut buffer[0..24]);
+    // let payload = [u8; 10];
+    let mut time: [u8; 8] = [0; 8];
+    BigEndian::write_u64(&mut time, now);
+    let sec: u32 = BigEndian::read_u32(&time[0..4]);
+    LittleEndian::write_u32(&mut buffer[24..28], 0x0030);
+    LittleEndian::write_u16(&mut buffer[28..30], 0);
+    LittleEndian::write_u32(&mut buffer[30..34], sec);
+    for i in 0..34 {
+        print!("{:x} ", buffer[i]);
+    }
+    stream.write(&buffer);
+    let precise:u32 = BigEndian::read_u32(&time[4..8]);
+    LittleEndian::write_u32(&mut buffer[24..28], 0x0031);
+    LittleEndian::write_u16(&mut buffer[28..30], 0);
+    LittleEndian::write_u32(&mut buffer[30..34], precise);
+    stream.write(&buffer);
 }
 
 fn main() {
@@ -422,46 +483,46 @@ fn main() {
 
     let mut stream = TcpStream::connect("192.168.0.1:12002").unwrap();
     sync_time(&mut stream);
-    // let mut buffer: [u8; 24] = [0; 24];
-    // let mut file = BufWriter::new(File::create(output).unwrap());
-    // loop {
-    //     let msg_len = stream.read(&mut buffer[..]).unwrap();
-    //     if msg_len == 24 {
-    //         let header = Header::new(buffer);
-    //         if header.magic_word == 0xaffec0c2 {
-    //             let mut payload: Vec<u8> = receive_payload(&mut stream, header.size_of_message_data);
-    //             // println!("payload ");
-    //             // for i in 0..(h.size_of_message_data as usize) {
-    //             //     print!("{:02x}", payload[i]);
-    //             // }
-    //             // println!("");
-    //             match header.data_type {
-    //                 DataType::Command => {
-    //                     // header.print();
-    //                 },
-    //                 DataType::CommandReply => {
-    //                     // header.print();
-    //                 },
-    //                 DataType::Error => {
-    //                     // header.print();
-    //                 },
-    //                 DataType::ScanData => {
-    //                     // header.print();
-    //                     // let scan_data = ScanData::new(payload.as_slice());
-    //                 },
-    //                 DataType::ObjectData => {
-    //                     header.print();
-    //                     let object_data = ObjectData::new(payload.as_slice());
-    //                     // object_data.print();
-    //                     let s_object_data = serde_yaml::to_string(&object_data).unwrap();
-    //                     file.write(s_object_data.as_bytes()).unwrap();
-    //                     file.write(b"\n").unwrap();
-    //                 },
-    //                 DataType::MovementData => {},
-    //                 DataType::EgoMotionData => {},
-    //                 DataType::SensorInfo => {},
-    //             }
-    //         }
-    //     }
-    // }
+    let mut buffer: [u8; 24] = [0; 24];
+    let mut file = BufWriter::new(File::create(output).unwrap());
+    loop {
+        let msg_len = stream.read(&mut buffer[..]).unwrap();
+        if msg_len == 24 {
+            let header = Header::new(buffer);
+            if header.magic_word == 0xaffec0c2 {
+                let mut payload: Vec<u8> = receive_payload(&mut stream, header.size_of_message_data);
+                // println!("payload ");
+                // for i in 0..(h.size_of_message_data as usize) {
+                //     print!("{:02x}", payload[i]);
+                // }
+                // println!("");
+                match header.data_type {
+                    DataType::Command => {
+                        // header.print();
+                    },
+                    DataType::CommandReply => {
+                        // header.print();
+                    },
+                    DataType::Error => {
+                        // header.print();
+                    },
+                    DataType::ScanData => {
+                        // header.print();
+                        // let scan_data = ScanData::new(payload.as_slice());
+                    },
+                    DataType::ObjectData => {
+                        header.print();
+                        let object_data = ObjectData::new(payload.as_slice());
+                        // object_data.print();
+                        let s_object_data = serde_yaml::to_string(&object_data).unwrap();
+                        file.write(s_object_data.as_bytes()).unwrap();
+                        file.write(b"\n").unwrap();
+                    },
+                    DataType::MovementData => {},
+                    DataType::EgoMotionData => {},
+                    DataType::SensorInfo => {},
+                }
+            }
+        }
+    }
 }
