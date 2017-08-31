@@ -46,6 +46,7 @@ impl FromPrimitive for DataType {
             _ => None,
         }
     }
+
     fn from_u64(n: u64) -> Option<DataType> {
         match n {
             0x2010 => Some(DataType::Command),
@@ -75,6 +76,7 @@ impl ToPrimitive for DataType {
                 _ => None,
         }
     }
+
     fn to_u64(self: &DataType) -> Option<u64> {
         match self {
                 &DataType::Command => Some(0x2010),
@@ -98,7 +100,7 @@ struct Header {
     reserved: u8,
     device_id: u8,
     data_type: DataType,
-    ntp_time: u64,
+    ntp_time: NtpTime,
 }
 
 impl Header {
@@ -110,14 +112,18 @@ impl Header {
             reserved: buffer[12],
             device_id: buffer[13],
             data_type: DataType::from_u16(BigEndian::read_u16(&buffer[14..16])).unwrap(),
-            ntp_time: BigEndian::read_u64(&buffer[16..24]),
+            ntp_time: NtpTime {
+                secs: BigEndian::read_u32(&buffer[16..20]),
+                precise: BigEndian::read_u32(&buffer[20..24]),
+            },
         }
     }
+
     fn print(&self) {
         println!("magic_word: {:x}", self.magic_word);
         println!("size_of_previous_messages: {}", self.size_of_previous_messages);
         println!("size_of_message_data: {}", self.size_of_message_data);
-        // println!("reserved: {:x}", self.reserved);
+        println!("reserved: {:x}", self.reserved);
         println!("device_id: {}", self.device_id);
         match self.data_type {
             DataType::Command => println!("data_type: Command"),
@@ -130,7 +136,19 @@ impl Header {
             DataType::SensorInfo => println!("data_type: SensorInfo"),
             _ => {},
         }
-        println!("ntp_time {:x}", self.ntp_time);
+        print!("ntp_time: ");
+        self.ntp_time.print_datetime();
+    }
+
+    fn encode(&self, buffer: &mut [u8]) {
+        BigEndian::write_u32(&mut buffer[0..4], self.magic_word);
+        BigEndian::write_u32(&mut buffer[4..8], self.size_of_previous_messages);
+        BigEndian::write_u32(&mut buffer[8..12], self.size_of_message_data);
+        buffer[12] = self.reserved;
+        buffer[13] = self.device_id;
+        BigEndian::write_u16(&mut buffer[14..16], self.data_type.to_u64().unwrap() as u16);
+        BigEndian::write_u32(&mut buffer[16..20], self.ntp_time.secs);
+        BigEndian::write_u32(&mut buffer[20..24], self.ntp_time.precise);
     }
 }
 
@@ -139,8 +157,8 @@ struct ScanData {
     scan_number: u16,
     scanner_status: u16,
     sync_phase_offset: u16,
-    scan_start_time_ntp: u64,
-    scan_end_time_ntp: u64,
+    scan_start_time_ntp: NtpTime,
+    scan_end_time_ntp: NtpTime,
     angle_ticks_per_rotation: u16,
     start_angle: i16,
     end_angle: i16,
@@ -161,8 +179,14 @@ impl ScanData {
             scan_number: LittleEndian::read_u16(&buffer[0..2]),
             scanner_status: LittleEndian::read_u16(&buffer[2..4]),
             sync_phase_offset:LittleEndian::read_u16(&buffer[4..6]),
-            scan_start_time_ntp: LittleEndian::read_u64(&buffer[6..14]),
-            scan_end_time_ntp: LittleEndian::read_u64(&buffer[14..22]),
+            scan_start_time_ntp: NtpTime {
+                secs: LittleEndian::read_u32(&buffer[10..14]),
+                precise: LittleEndian::read_u32(&buffer[6..10]),
+            },
+            scan_end_time_ntp: NtpTime {
+                secs: LittleEndian::read_u32(&buffer[18..22]),
+                precise: LittleEndian::read_u32(&buffer[14..18]),
+            },
             angle_ticks_per_rotation: LittleEndian::read_u16(&buffer[22..24]),
             start_angle: LittleEndian::read_i16(&buffer[24..26]),
             end_angle: LittleEndian::read_i16(&buffer[26..28]),
@@ -213,9 +237,10 @@ impl ScanPoint {
     }
 }
 
+// ntp_time
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct ObjectData {
-    scan_start_timestamp: u64,
+    scan_start_timestamp: NtpTime,
     number_of_objects: u16,
     objects_vec: Vec<ObjectInfo>,
 }
@@ -223,7 +248,10 @@ struct ObjectData {
 impl ObjectData {
     fn new(buffer: &[u8]) -> ObjectData {
         let mut object_data = ObjectData {
-            scan_start_timestamp: LittleEndian::read_u64(&buffer[0..8]),
+            scan_start_timestamp: NtpTime {
+                secs: LittleEndian::read_u32(&buffer[4..8]),
+                precise: LittleEndian::read_u32(&buffer[0..4]),
+            },
             number_of_objects: LittleEndian::read_u16(&buffer[8..10]),
             objects_vec: Vec::new(),
         };
@@ -238,8 +266,10 @@ impl ObjectData {
         }
         object_data
     }
+
     fn print(&self) {
-        println!("scan_start_timestamp: {}", self.scan_start_timestamp);
+        print!("scan_start_timestamp: ");
+        self.scan_start_timestamp.print();
         println!("number_of_object: {}", self.number_of_objects);
         for i in 0..self.objects_vec.len() {
             println!("object{}:", i);
@@ -392,6 +422,38 @@ impl Size2D {
     }
 }
 
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct NtpTime {
+    secs: u32,
+    precise: u32,
+}
+
+impl NtpTime {
+    fn datetime(&self) -> DateTime<Utc> {
+        let standard_time: DateTime<Utc> = Utc.ymd(1900, 1, 1).and_hms(0, 0, 0);
+        let duration_secs: Duration = Duration::seconds(self.secs as i64);
+        let precise = self.precise * (pow::pow(10, 9) / pow::pow(2, 32));
+        let duration_precise: Duration = Duration::nanoseconds(precise as i64);
+        let duration = duration_secs + duration_precise;
+        let utc: DateTime<Utc> = standard_time + duration;
+        utc
+    }
+
+    fn print(&self) {
+        println!("{}, {}", self.secs, self.precise);
+    }
+
+    fn print_datetime(&self) {
+        let standard_time: DateTime<Utc> = Utc.ymd(1900, 1, 1).and_hms(0, 0, 0);
+        let duration_secs: Duration = Duration::seconds(self.secs as i64);
+        let precise = ((self.precise as f64) * (4294967296.0 / 1000000000.0)).round() as u32;
+        let duration_precise: Duration = Duration::nanoseconds(precise as i64);
+        let duration = duration_secs + duration_precise;
+        let utc: DateTime<Utc> = standard_time + duration;
+        println!("{:?}", utc);
+    }
+}
+
 fn receive_payload(stream: &mut std::net::TcpStream, payload_len: u32) -> Vec<u8> {
     let mut remaining_len: u32 = payload_len;
     let mut buffer: [u8; 1024] = [0; 1024];
@@ -411,31 +473,20 @@ fn print_usage(program: &str, opts: Options) {
 }
 
 fn ntp_time_now() -> u64 {
-    let local: DateTime<Utc> = Utc::now();
+    let utc: DateTime<Utc> = Utc::now();
     let standard_time: DateTime<Utc> = Utc.ymd(1900, 1, 1).and_hms(0, 0, 0);
-    let diff = local.signed_duration_since(standard_time);
-    println!("{:?}", diff.num_seconds() as u32);
-    println!("{:?}", diff.num_seconds());
+    let diff = utc.signed_duration_since(standard_time);
     let mut buffer: [u8; 8] = [0; 8];
-    let precise = diff.num_nanoseconds().unwrap() * (pow::pow(2, 32) / pow::pow(10, 9));
+    print!("{:?}", pow::pow(2, 32));
+    let precise = ((diff.num_nanoseconds().unwrap() as f64) * (4294967296.0 / 1000000000.0)).round() as u32;
     BigEndian::write_u32(&mut buffer[0..4], diff.num_seconds() as u32);
     BigEndian::write_u32(&mut buffer[4..8], precise as u32);
     BigEndian::read_u64(&buffer)
 }
 
-fn encode_header(header: &Header, buffer: &mut [u8]) {
-    BigEndian::write_u32(&mut buffer[0..4], header.magic_word);
-    BigEndian::write_u32(&mut buffer[4..8], header.size_of_previous_messages);
-    BigEndian::write_u32(&mut buffer[8..12], header.size_of_message_data);
-    buffer[12] = header.reserved;
-    buffer[13] = header.device_id;
-    BigEndian::write_u16(&mut buffer[14..16], header.data_type.to_u64().unwrap() as u16);
-    BigEndian::write_u64(&mut buffer[16..24], header.ntp_time);
-}
-
 fn sync_time(stream: &mut TcpStream) {
     let mut buffer: [u8; 34] = [0; 34];
-    let now: u64 = ntp_time_now();
+
     let header: Header = Header {
         magic_word: 0xaffec0c2,
         size_of_previous_messages: 0,
@@ -443,21 +494,24 @@ fn sync_time(stream: &mut TcpStream) {
         reserved: 0,
         device_id: 1,
         data_type: DataType::Command,
-        ntp_time: 0,
+        ntp_time: NtpTime {
+            secs: 0,
+            precise: 0,
+        },
     };
-    encode_header(&header, &mut buffer[0..24]);
-    // let payload = [u8; 10];
+    header.encode(&mut buffer[0..24]);
+
+    let now: u64 = ntp_time_now();
     let mut time: [u8; 8] = [0; 8];
     BigEndian::write_u64(&mut time, now);
     let sec: u32 = BigEndian::read_u32(&time[0..4]);
+    let precise:u32 = BigEndian::read_u32(&time[4..8]);
+
     LittleEndian::write_u32(&mut buffer[24..28], 0x0030);
     LittleEndian::write_u16(&mut buffer[28..30], 0);
     LittleEndian::write_u32(&mut buffer[30..34], sec);
-    for i in 0..34 {
-        print!("{:x} ", buffer[i]);
-    }
     stream.write(&buffer);
-    let precise:u32 = BigEndian::read_u32(&time[4..8]);
+
     LittleEndian::write_u32(&mut buffer[24..28], 0x0031);
     LittleEndian::write_u16(&mut buffer[28..30], 0);
     LittleEndian::write_u32(&mut buffer[30..34], precise);
@@ -467,7 +521,6 @@ fn sync_time(stream: &mut TcpStream) {
 fn main() {
     let args: Vec<String> = env::args().collect();
     let program = args[0].clone();
-
     let mut opts = Options::new();
     opts.optopt("o", "", "set output file name", "NAME");
     opts.optflag("h", "help", "print this help menu");
